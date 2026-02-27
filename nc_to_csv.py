@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-ERA5 single-level zip (.zip containing .nc) -> tidy pandas DataFrame.
-
-- Required vars: u10, v10, t2m, d2m, sp, blh
-- Optional vars: tp (total precipitation)
-
-Also:
-- Rename valid_time -> time if needed
-- Squeeze expver dimension if exists
-- Unit conversions:
-  t2m/d2m: K -> C
-  sp: Pa -> hPa
-  tp: m -> mm
-- Derived:
-  wind_speed, wind_dir (meteorological, degrees), rh (%)
-
-Usage (CLI):
-  python nc_to_csv.py --zip era5_single_202001.zip --out era5_202001.parquet
-  python nc_to_csv.py --zip era5_single_202001.zip --out era5_202001.csv --format csv
-
-Usage (Jupyter):
-  import nc_to_csv
-  df = nc_to_csv.load_zip_nc_to_df("era5_single_202001.zip")
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -75,12 +47,12 @@ def _rh_from_t_td_c(t_c: xr.DataArray, td_c: xr.DataArray) -> xr.DataArray:
 
 def _wind_speed_dir(u: xr.DataArray, v: xr.DataArray):
     # wind direction: meteorological (from which it blows)
-    speed = np.sqrt(u ** 2 + v ** 2)
+    speed = np.sqrt(u**2 + v**2)
     direction = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
     return speed, direction
 
 
-# ---------------- core ----------------
+# ---------------- core: single zip -> df ----------------
 def load_zip_nc_to_df(zip_path: str | Path) -> pd.DataFrame:
     """
     Load ERA5 single-level zip file and return tidy DataFrame.
@@ -124,13 +96,12 @@ def load_zip_nc_to_df(zip_path: str | Path) -> pd.DataFrame:
             "v10": ["v10", "10m_v_component_of_wind"],
             "t2m": ["t2m", "2m_temperature"],
             "d2m": ["d2m", "2m_dewpoint_temperature"],
-            "sp":  ["sp", "surface_pressure"],
+            "sp": ["sp", "surface_pressure"],
             "blh": ["blh", "boundary_layer_height"],
-            "tp":  ["tp", "total_precipitation"],  # optional
+            "tp": ["tp", "total_precipitation"],  # optional
         }
 
         required_keys = ["u10", "v10", "t2m", "d2m", "sp", "blh"]
-        optional_keys = ["tp"]
 
         chosen: dict[str, str] = {}
         missing_required: list[tuple[str, list[str]]] = []
@@ -216,37 +187,96 @@ def load_zip_nc_to_df(zip_path: str | Path) -> pd.DataFrame:
         return df
 
 
+# ---------------- core: folder of zips -> big df ----------------
+def load_folder_zips_to_df(
+    folder: str | Path,
+    pattern: str = "*.zip",
+    recursive: bool = False,
+    keep_source_col: bool = True,
+) -> pd.DataFrame:
+    """
+    Read all zip files under folder, decode each .nc into df, concat, sort by time asc.
+
+    Parameters
+    ----------
+    folder : str | Path
+        Folder containing zip files.
+    pattern : str
+        Glob pattern, default "*.zip".
+    recursive : bool
+        If True, use rglob instead of glob.
+    keep_source_col : bool
+        If True, add a 'source_zip' column for traceability.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated and time-sorted DataFrame.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Not a directory: {folder}")
+
+    zip_paths = sorted(folder.rglob(pattern) if recursive else folder.glob(pattern))
+    if not zip_paths:
+        raise ValueError(f"No zip files matched pattern='{pattern}' in: {folder}")
+
+    dfs: list[pd.DataFrame] = []
+    failures: list[tuple[str, str]] = []
+
+    for zp in zip_paths:
+        try:
+            df_one = load_zip_nc_to_df(zp)
+            if keep_source_col:
+                df_one["source_zip"] = zp.name
+            dfs.append(df_one)
+            print(f"[OK] {zp.name}: rows={len(df_one):,} cols={len(df_one.columns)}")
+        except Exception as e:
+            failures.append((str(zp), repr(e)))
+            print(f"[FAIL] {zp.name}: {e}")
+
+    if not dfs:
+        msg = "\n".join([f"- {p}: {err}" for p, err in failures])
+        raise RuntimeError(f"All zip files failed. Errors:\n{msg}")
+
+    big = pd.concat(dfs, ignore_index=True)
+
+    if "time" in big.columns:
+        big["time"] = pd.to_datetime(big["time"], errors="coerce")
+        big = big.sort_values("time", ascending=True, kind="mergesort").reset_index(drop=True)
+
+    # Optional: if failures exist, warn (but still return output)
+    if failures:
+        print(f"[WARN] {len(failures)} files failed. Output excludes them.")
+
+    return big
+
+
 # ---------------- CLI ----------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--zip", dest="zip_path", required=True, help="Path to era5_single_yyyymm.zip")
-    p.add_argument("--out", dest="out_path", required=True, help="Output file path (.parquet or .csv)")
-    p.add_argument("--format", choices=["parquet", "csv"], default=None, help="Force output format")
-    p.add_argument("--csv-index", action="store_true", help="When output is csv, keep index (default: False)")
+    p.add_argument("--in-dir", dest="in_dir", required=True, help="Folder containing .zip files")
+    p.add_argument("--out-csv", dest="out_csv", required=True, help="Output CSV path")
+    p.add_argument("--pattern", default="*.zip", help="Glob pattern (default: *.zip)")
+    p.add_argument("--recursive", action="store_true", help="Search zip files recursively")
+    p.add_argument("--no-source-col", action="store_true", help="Do NOT add source_zip column")
     args = p.parse_args()
 
-    zip_path = Path(args.zip_path)
-    out_path = Path(args.out_path)
+    in_dir = Path(args.in_dir)
+    out_csv = Path(args.out_csv)
 
-    fmt = args.format
-    if fmt is None:
-        suf = out_path.suffix.lower()
-        if suf == ".parquet":
-            fmt = "parquet"
-        elif suf == ".csv":
-            fmt = "csv"
-        else:
-            fmt = "parquet"
+    df = load_folder_zips_to_df(
+        folder=in_dir,
+        pattern=args.pattern,
+        recursive=args.recursive,
+        keep_source_col=not args.no_source_col,
+    )
 
-    df = load_zip_nc_to_df(zip_path)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if fmt == "parquet":
-        df.to_parquet(out_path, index=False)
-    else:
-        df.to_csv(out_path, index=args.csv_index)
-
-    print(f"[OK] rows={len(df):,} cols={len(df.columns)} -> {out_path}")
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"[OK] total rows={len(df):,} cols={len(df.columns)} -> {out_csv}")
 
 
 if __name__ == "__main__":
