@@ -18,9 +18,8 @@
 """
 from __future__ import annotations
 
-import argparse
 import pathlib
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -207,32 +206,65 @@ def build_reanalysis_by_district(reanalysis: pd.DataFrame) -> pd.DataFrame:
 # End-to-end merging
 # ---------------------------------------------------------------------------
 
-def align_time_range(reference: pd.DataFrame, *others: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp, list[pd.DataFrame]]:
-    """将其他 DataFrame 的时间范围修剪到 ``reference`` 的时间跨度。
-    return (start, end, trimmed_others).
+def aggregate_pm_detail_by_district_hour(pm_detail: pd.DataFrame) -> pd.DataFrame:
+    """将站点级 PM2.5 小时观测聚合为行政区级小时均值。
+
+    ``processed_pm_detail.csv`` 中同一 ``district + datetime`` 可能包含多个站点。
+    merged_dataset 需要的是行政区级小时 PM2.5，因此这里先按区和小时对
+    ``average_pm25_hour`` 求均值，并保留参与均值的站点数用于后续诊断。
     """
 
-    start = reference["datetime"].min()
-    end = reference["datetime"].max()
+    pm_d = _floor_to_hour(_ensure_datetime_col(pm_detail, "datetime"), "datetime")
+    required_cols = ["district", "datetime", "average_pm25_hour"]
+    missing_cols = [c for c in required_cols if c not in pm_d.columns]
+    if missing_cols:
+        raise KeyError(f"pm_detail missing required columns: {missing_cols}")
+
+    pm_d = pm_d.dropna(subset=["district", "datetime"])
+    pm_d["average_pm25_hour"] = pd.to_numeric(pm_d["average_pm25_hour"], errors="coerce")
+
+    return (
+        pm_d.groupby(["district", "datetime"], as_index=False)
+        .agg(
+            average_pm25_hour=("average_pm25_hour", "mean"),
+            pm25_site_count=("average_pm25_hour", lambda x: x.notna().sum()),
+        )
+        .sort_values(["district", "datetime"])
+        .reset_index(drop=True)
+    )
+
+
+def align_time_range(reference: pd.DataFrame, *others: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp, list[pd.DataFrame]]:
+    """Trim other DataFrames to the time span of ``reference``.
+    Returns (start, end, trimmed_others).
+    """
+
+    ref = reference.copy()
+    ref["datetime"] = pd.to_datetime(ref["datetime"], errors="coerce")
+    start = ref["datetime"].min()
+    end = ref["datetime"].max()
+
     trimmed = []
     for df in others:
         tmp = df.copy()
+        tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+        tmp = tmp.dropna(subset=["datetime"])
         tmp = tmp[(tmp["datetime"] >= start) & (tmp["datetime"] <= end)]
         trimmed.append(tmp)
-    return start, end, trimmed
 
+    return start, end, trimmed
 
 def merge_hourly_sources(
     reanalysis_by_district: pd.DataFrame,
     weather_hourly: pd.DataFrame,
     pm_detail: pd.DataFrame,
 ) -> pd.DataFrame:
-    """合并再分析（目标区）与小时气象和 PM 详细数据。"""
+    """合并再分析（目标区）与小时气象、行政区级 PM2.5 小时数据。"""
 
     weather_h = _floor_to_hour(_ensure_datetime_col(weather_hourly, "datetime"), "datetime")
     weather_h = weather_h.sort_values("datetime").drop_duplicates("datetime", keep="last")
 
-    pm_d = _floor_to_hour(_ensure_datetime_col(pm_detail, "datetime"), "datetime")
+    pm_d = aggregate_pm_detail_by_district_hour(pm_detail)
 
     rea = _floor_to_hour(_ensure_datetime_col(reanalysis_by_district, "datetime"), "datetime")
 
@@ -309,49 +341,34 @@ def run_pipeline(
     return merged
 
 
-# ---------------------------------------------------------------------------
-# CLI entry
-# ---------------------------------------------------------------------------
+DEFAULT_AIR_QUALITY_PATH = pathlib.Path("../data/processed_air_quality_data.csv")
+DEFAULT_PM_DETAIL_PATH = pathlib.Path("../data/processed_pm_detail.csv")
+DEFAULT_WEATHER_PATH = pathlib.Path("../data/processed_weather_data.csv")
+DEFAULT_REANALYSIS_PATH = pathlib.Path("../data/total_era5.csv")
+DEFAULT_OUTPUT_PATH = pathlib.Path("../data/merged_dataset.csv")
 
-def _parse_args(args: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build merged PM2.5 dataset")
-    parser.add_argument("--air-quality", required=True, type=pathlib.Path, dest="air_quality")
-    parser.add_argument("--pm-detail", required=True, type=pathlib.Path, dest="pm_detail")
-    parser.add_argument("--weather", required=True, type=pathlib.Path)
-    parser.add_argument("--reanalysis", required=True, type=pathlib.Path)
-    parser.add_argument("--output", type=pathlib.Path, help="Path to save merged CSV")
-    parser.add_argument("--min-obs", type=int, default=1, help="Minimum observations per hour window")
-    parser.add_argument(
-        "--strict-wind-dir",
-        action="store_true",
-        help="Use vector mean for wind direction (recommended)",
+
+def run_pipeline_with_defaults(
+    output_csv: Optional[pathlib.Path] = DEFAULT_OUTPUT_PATH,
+    *,
+    min_obs_per_hour: int = 1,
+    strict_wind_dir: bool = True,
+) -> pd.DataFrame:
+    """使用项目默认输入文件路径运行整合流水线。
+
+    默认输入文件：
+    - `../data/processed_air_quality_data.csv`
+    - `../data/processed_pm_detail.csv`
+    - `../data/processed_weather_data.csv`
+    - `../data/total_era5.csv`
+    """
+
+    return run_pipeline(
+        air_quality_path=DEFAULT_AIR_QUALITY_PATH,
+        pm_detail_path=DEFAULT_PM_DETAIL_PATH,
+        weather_path=DEFAULT_WEATHER_PATH,
+        reanalysis_path=DEFAULT_REANALYSIS_PATH,
+        output_csv=output_csv,
+        min_obs_per_hour=min_obs_per_hour,
+        strict_wind_dir=strict_wind_dir,
     )
-    parser.add_argument(
-        "--no-strict-wind-dir",
-        dest="strict_wind_dir",
-        action="store_false",
-        help="Use arithmetic mean for wind direction",
-    )
-    parser.set_defaults(strict_wind_dir=True)
-    return parser.parse_args(args=args)
-
-
-def main(argv: Optional[Iterable[str]] = None) -> None:
-    ns = _parse_args(argv)
-    merged = run_pipeline(
-        air_quality_path=ns.air_quality,
-        pm_detail_path=ns.pm_detail,
-        weather_path=ns.weather,
-        reanalysis_path=ns.reanalysis,
-        output_csv=ns.output,
-        min_obs_per_hour=ns.min_obs,
-        strict_wind_dir=ns.strict_wind_dir,
-    )
-    if ns.output:
-        print(f"Merged dataset saved to {ns.output}")
-    else:
-        print(merged.head())
-
-
-if __name__ == "__main__":
-    main()
